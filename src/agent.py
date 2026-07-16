@@ -4,6 +4,8 @@ import json
 import asyncio
 from pathlib import Path
 
+
+
 from dotenv import load_dotenv
 from livekit import rtc
 from livekit.agents import AutoSubscribe, JobContext, JobProcess, WorkerOptions, cli, llm
@@ -14,6 +16,7 @@ import tools  # noqa: F401 – registers agent_tools
 from memory.short_term import ShortTermMemory
 from memory.summarizer import ConversationSummarizer
 from tools.registry import agent_tools
+from modes.registry import ModeRegistry
 from vision_service import VisionService
 
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
@@ -53,15 +56,11 @@ async def entrypoint(job: JobContext) -> None:
     short_term: ShortTermMemory = job.proc.userdata["short_term"]
     summarizer: ConversationSummarizer = job.proc.userdata["summarizer"]
 
+    mode_registry = ModeRegistry(Path(__file__).parent / "modes" / "configs")
+
     agent = Agent(
-        instructions=(
-            "You are a helpful AI Voice Assistant. "
-            "You can see the user via their camera and screen share. "
-            "Speak naturally. Keep responses concise. "
-            "Only use tools when the user explicitly asks for weather, "
-            "calculations, or web search. Otherwise just reply conversationally."
-        ),
-        tools=agent_tools or None,
+        instructions=mode_registry.get_system_prompt(),
+        tools=mode_registry.get_filtered_tools() or None,
     )
 
     llm_instance = _create_llm()
@@ -90,17 +89,18 @@ async def entrypoint(job: JobContext) -> None:
             logger.exception("Chat handler failed")
 
     def _on_data_received(packet: rtc.DataPacket) -> None:
-        if packet.topic != "chat":
-            return
         try:
             data = json.loads(packet.data)
-            msg = data.get("message", data.get("text", "")) if isinstance(data, dict) else data
+        except json.JSONDecodeError:
+            data = {}
+
+        if packet.topic == "chat":
+            msg = data.get("message", data.get("text", "")) if isinstance(data, dict) else packet.data.decode("utf-8", errors="replace")
             if isinstance(msg, str) and msg.strip():
                 asyncio.create_task(_handle_chat_text(msg.strip()))
-        except json.JSONDecodeError:
-            text = packet.data.decode("utf-8", errors="replace")
-            if text.strip():
-                asyncio.create_task(_handle_chat_text(text.strip()))
+        elif packet.topic == "mode:switch":
+            mode_id = data.get("id", "general")
+            asyncio.create_task(_switch_mode(mode_id, agent, mode_registry, job))
 
     job.room.on("data_received", _on_data_received)
 
@@ -151,6 +151,12 @@ async def entrypoint(job: JobContext) -> None:
         reliable=True,
     )
 
+    # Publish available modes so frontend knows what to show
+    await job.room.local_participant.publish_data(
+        json.dumps({"type": "mode_list", "data": mode_registry.all_public()}),
+        reliable=True,
+    )
+
     logger.info("Agent ready")
 
 
@@ -177,6 +183,35 @@ async def _generate_summary(
             short_term.clear()
     except Exception:
         logger.exception("Summarization failed")
+
+
+async def _switch_mode(
+    mode_id: str,
+    agent: Agent,
+    mode_registry: ModeRegistry,
+    job: JobContext,
+) -> None:
+    try:
+        mode = mode_registry.switch_to(mode_id)
+        mode_registry.apply_to_agent(agent)
+        await job.room.local_participant.publish_data(
+            json.dumps({
+                "type": "mode_changed",
+                "data": {
+                    "id": mode.id,
+                    "name": mode.name,
+                    "icon": mode.icon,
+                    "description": mode.description,
+                    "vision_enabled": mode.vision_enabled,
+                    "reasoning_enabled": mode.reasoning_enabled,
+                    "tools": mode.tools,
+                },
+            }),
+            reliable=True,
+        )
+        logger.info("Mode switched to: %s (%s)", mode.id, mode.name)
+    except Exception:
+        logger.exception("Failed to switch mode")
 
 
 if __name__ == "__main__":
